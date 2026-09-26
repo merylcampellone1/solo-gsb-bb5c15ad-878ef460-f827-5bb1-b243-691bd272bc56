@@ -343,14 +343,24 @@ def reset_all() -> None:
     conn.commit()
 
 
-def fetch_rule(rule_id: int) -> dict | None:
-    row = query_one("SELECT * FROM rules WHERE id = ?", (rule_id,))
+def _execute_target(
+    conn: sqlite3.Connection | None,
+) -> sqlite3.Connection:
+    """Connection for a fetch helper: the given one (e.g. the writer while it
+    holds a transaction), else the read layer's current target (a pinned
+    snapshot or the thread's autocommit reader)."""
+    return conn if conn is not None else _read_target()
+
+
+def fetch_rule(rule_id: int, conn: sqlite3.Connection | None = None) -> dict | None:
+    target = _execute_target(conn)
+    row = target.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
     if row is None:
         return None
-    conds = query(
+    conds = target.execute(
         "SELECT * FROM rule_conditions WHERE rule_id = ? ORDER BY ord, id",
         (rule_id,),
-    )
+    ).fetchall()
     return {
         "id": row["id"],
         "name": row["name"],
@@ -371,9 +381,10 @@ def fetch_rule(rule_id: int) -> dict | None:
     }
 
 
-def fetch_rules() -> list[dict]:
-    rows = query("SELECT id FROM rules ORDER BY id")
-    return [r for r in (fetch_rule(row["id"]) for row in rows) if r]
+def fetch_rules(conn: sqlite3.Connection | None = None) -> list[dict]:
+    target = _execute_target(conn)
+    rows = target.execute("SELECT id FROM rules ORDER BY id").fetchall()
+    return [r for r in (fetch_rule(row["id"], target) for row in rows) if r]
 
 
 def upsert_event(
@@ -456,8 +467,13 @@ def snapshot_import_key(
         )
 
 
-def fetch_maintenance_window(window_id: int) -> dict | None:
-    row = query_one("SELECT * FROM maintenance_windows WHERE id = ?", (window_id,))
+def fetch_maintenance_window(
+    window_id: int, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    target = _execute_target(conn)
+    row = target.execute(
+        "SELECT * FROM maintenance_windows WHERE id = ?", (window_id,)
+    ).fetchone()
     if row is None:
         return None
     return {
@@ -475,6 +491,7 @@ def fetch_maintenance_windows(
     start: float | None = None,
     end: float | None = None,
     device: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Windows overlapping the half-open filter window [start, end)."""
     where = []
@@ -489,11 +506,16 @@ def fetch_maintenance_windows(
         where.append("device = ?")
         params.append(device)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
-    rows = query(
+    target = _execute_target(conn)
+    rows = target.execute(
         f"SELECT id FROM maintenance_windows{clause} ORDER BY start_ts, device, id",
-        params,
-    )
-    return [w for w in (fetch_maintenance_window(r["id"]) for r in rows) if w]
+        tuple(params),
+    ).fetchall()
+    return [
+        w
+        for w in (fetch_maintenance_window(r["id"], target) for r in rows)
+        if w
+    ]
 
 
 def faults_for_export() -> list[dict]:
@@ -527,11 +549,14 @@ def faults_for_export() -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def fetch_channel_ttl(device: str, metric: str) -> dict | None:
-    row = query_one(
+def fetch_channel_ttl(
+    device: str, metric: str, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    target = _execute_target(conn)
+    row = target.execute(
         "SELECT * FROM channel_ttls WHERE device = ? AND metric = ?",
         (device, metric),
-    )
+    ).fetchone()
     if row is None:
         return None
     return {
@@ -543,7 +568,9 @@ def fetch_channel_ttl(device: str, metric: str) -> dict | None:
 
 
 def fetch_channel_ttls(
-    device: str | None = None, metric: str | None = None
+    device: str | None = None,
+    metric: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """All configured sample validity periods; channels without a row are absent
     (they keep the legacy hold-to-next-sample semantics)."""
@@ -556,11 +583,12 @@ def fetch_channel_ttls(
         where.append("metric = ?")
         params.append(metric)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
-    rows = query(
+    target = _execute_target(conn)
+    rows = target.execute(
         f"SELECT device, metric, ttl_seconds, updated_at FROM channel_ttls{clause}"
         " ORDER BY device, metric",
-        params,
-    )
+        tuple(params),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

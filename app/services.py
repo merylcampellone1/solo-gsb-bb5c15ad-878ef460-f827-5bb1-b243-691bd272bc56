@@ -303,10 +303,12 @@ def undo_import(import_id: int, reevaluate: bool = True) -> dict:
     return result
 
 
-def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | None]:
+def _load_events_index(conn) -> tuple[dict[tuple[str, str], list[Event]], float | None]:
     events_by_channel: dict[tuple[str, str], list[Event]] = defaultdict(list)
     horizon: float | None = None
-    for row in db.query("SELECT id, device, metric, ts, value FROM events ORDER BY ts, id"):
+    for row in conn.execute(
+        "SELECT id, device, metric, ts, value FROM events ORDER BY ts, id"
+    ).fetchall():
         if row["value"] is None:
             continue
         ev = Event(
@@ -321,7 +323,7 @@ def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | No
     return events_by_channel, horizon
 
 
-def _load_maintenance_windows() -> list[MaintenanceWindow]:
+def _load_maintenance_windows(conn) -> list[MaintenanceWindow]:
     """All stored planned-maintenance windows as engine inputs."""
     return [
         MaintenanceWindow(
@@ -331,11 +333,11 @@ def _load_maintenance_windows() -> list[MaintenanceWindow]:
             end=w["end"],
             name=w["name"],
         )
-        for w in db.fetch_maintenance_windows()
+        for w in db.fetch_maintenance_windows(conn=conn)
     ]
 
 
-def _load_channel_ttls() -> dict[tuple[str, str], float]:
+def _load_channel_ttls(conn) -> dict[tuple[str, str], float]:
     """Configured per-channel sample validity periods as engine input.
 
     Only channels with a positive configured TTL appear here; every other
@@ -343,7 +345,7 @@ def _load_channel_ttls() -> dict[tuple[str, str], float]:
     """
     return {
         (row["device"], row["metric"]): row["ttl_seconds"]
-        for row in db.fetch_channel_ttls()
+        for row in db.fetch_channel_ttls(conn=conn)
     }
 
 
@@ -356,23 +358,32 @@ def evaluate_all_rules() -> dict:
     Per-channel sample validity periods cap each sample's held interval, so
     expired stretches satisfy no condition and likewise reset the duration.
     The suppressed pieces are stored alongside for the timeline/export.
-    """
-    # Gather every evaluation input from one committed snapshot so the
-    # recomputed faults never combine rules/events/maintenance/TTLs read
-    # from different concurrent commits; the fault replacement below keeps
-    # its own write transaction boundary.
-    with db.read_snapshot():
-        rules = db.fetch_rules()
-        events_by_channel, horizon = _load_events_index()
-        if horizon is None:
-            horizon = 0.0
-        maintenance = _load_maintenance_windows()
-        ttl_by_channel = _load_channel_ttls()
 
+    The evaluation inputs (events, rules, TTLs and maintenance windows) and
+    the fault/suppressed replacement are read and written inside **one
+    serialized write transaction**.  A concurrent import (or rule / TTL /
+    maintenance write) therefore cannot commit between the input read and
+    the result write: every committed input set is evaluated exactly once,
+    in lock order, and the stored faults always correspond to the latest
+    committed inputs.  If the evaluation raises, the transaction is rolled
+    back wholesale — no rule is ever left with its old faults deleted but
+    the new ones only half written.
+    """
     total = 0
     total_suppressed = 0
     per_rule: list[dict] = []
     with db.transaction() as tx:
+        # Read every input on the writer connection while the write lock is
+        # held: no other writer (import_events, rule save, TTL/maintenance
+        # change) can commit until this evaluation commits, so these reads
+        # and the replacement below describe one committed input state.
+        rules = db.fetch_rules(conn=tx)
+        events_by_channel, horizon = _load_events_index(tx)
+        if horizon is None:
+            horizon = 0.0
+        maintenance = _load_maintenance_windows(tx)
+        ttl_by_channel = _load_channel_ttls(tx)
+
         for rule in rules:
             conditions = [Condition.from_dict(c) for c in rule["conditions"]]
             result = evaluate_rule(
@@ -461,32 +472,35 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
     fault tables.  The two confirmed fault sets are compared as half-open
     interval coverings (see :func:`diff_faults`).
     """
-    events_by_channel, horizon = _load_events_index()
-    if horizon is None:
-        horizon = 0.0
-    maintenance = _load_maintenance_windows()
-    ttl_by_channel = _load_channel_ttls()
+    # All read-only inputs share one committed view: the draft, its baseline
+    # and the supporting events/maintenance/TTLs never straddle a commit.
+    with db.read_snapshot() as conn:
+        events_by_channel, horizon = _load_events_index(conn)
+        if horizon is None:
+            horizon = 0.0
+        maintenance = _load_maintenance_windows(conn)
+        ttl_by_channel = _load_channel_ttls(conn)
 
-    baseline_rule = db.fetch_rule(rule_id) if rule_id is not None else None
-    if rule_id is not None and baseline_rule is None:
-        raise KeyError(f"rule {rule_id} not found")
+        baseline_rule = db.fetch_rule(rule_id, conn=conn) if rule_id is not None else None
+        if rule_id is not None and baseline_rule is None:
+            raise KeyError(f"rule {rule_id} not found")
 
-    def run(rule: dict, rid: int):
-        return evaluate_rule(
-            rule_id=rid,
-            logic=rule["logic"],
-            duration_required=rule["duration"],
-            conditions=[Condition.from_dict(c) for c in rule["conditions"]],
-            events_by_channel=events_by_channel,
-            horizon=horizon,
-            maintenance=maintenance,
-            ttl_by_channel=ttl_by_channel,
+        def run(rule: dict, rid: int):
+            return evaluate_rule(
+                rule_id=rid,
+                logic=rule["logic"],
+                duration_required=rule["duration"],
+                conditions=[Condition.from_dict(c) for c in rule["conditions"]],
+                events_by_channel=events_by_channel,
+                horizon=horizon,
+                maintenance=maintenance,
+                ttl_by_channel=ttl_by_channel,
+            )
+
+        baseline_result = (
+            run(baseline_rule, baseline_rule["id"]) if baseline_rule is not None else None
         )
-
-    baseline_result = (
-        run(baseline_rule, baseline_rule["id"]) if baseline_rule is not None else None
-    )
-    draft_result = run(draft, rule_id if rule_id is not None else -1)
+        draft_result = run(draft, rule_id if rule_id is not None else -1)
 
     baseline_faults = baseline_result.faults if baseline_result is not None else []
     segments = diff_faults(baseline_faults, draft_result.faults)
