@@ -285,8 +285,20 @@ def transaction():
             raise
 
 
-def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-    return _read_target().execute(sql, tuple(params)).fetchall()
+def query(
+    sql: str,
+    params: Iterable[Any] = (),
+    conn: sqlite3.Connection | None = None,
+) -> list[sqlite3.Row]:
+    """Run a SELECT and fetch all rows.
+
+    Without ``conn`` the read goes through the committed-view read layer
+    (an open read snapshot on this thread, otherwise the autocommit reader).
+    With ``conn`` the statement runs on that connection — used by the write
+    path to read its inputs inside its own serialized write transaction.
+    """
+    target = conn if conn is not None else _read_target()
+    return target.execute(sql, tuple(params)).fetchall()
 
 
 def query_batches(
@@ -313,8 +325,14 @@ def query_batches(
         cur.close()
 
 
-def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
-    return _read_target().execute(sql, tuple(params)).fetchone()
+def query_one(
+    sql: str,
+    params: Iterable[Any] = (),
+    conn: sqlite3.Connection | None = None,
+) -> sqlite3.Row | None:
+    """Single-row variant of :func:`query` (same connection routing)."""
+    target = conn if conn is not None else _read_target()
+    return target.execute(sql, tuple(params)).fetchone()
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -326,30 +344,33 @@ def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
 
 
 def reset_all() -> None:
-    conn = get_conn()
-    for table in (
-        "fault_intervals",
-        "suppressed_segments",
-        "rule_conditions",
-        "annotations",
-        "maintenance_windows",
-        "rules",
-        "events",
-        "import_snapshots",
-        "imports",
-        "channel_ttls",
-    ):
-        conn.execute(f"DELETE FROM {table}")
-    conn.commit()
+    # One serialized write transaction, like every other write path: a reset
+    # cannot interleave with an in-flight import or rule re-evaluation, so a
+    # stale evaluation can never resurrect faults after the reset commits.
+    with transaction() as conn:
+        for table in (
+            "fault_intervals",
+            "suppressed_segments",
+            "rule_conditions",
+            "annotations",
+            "maintenance_windows",
+            "rules",
+            "events",
+            "import_snapshots",
+            "imports",
+            "channel_ttls",
+        ):
+            conn.execute(f"DELETE FROM {table}")
 
 
-def fetch_rule(rule_id: int) -> dict | None:
-    row = query_one("SELECT * FROM rules WHERE id = ?", (rule_id,))
+def fetch_rule(rule_id: int, conn: sqlite3.Connection | None = None) -> dict | None:
+    row = query_one("SELECT * FROM rules WHERE id = ?", (rule_id,), conn=conn)
     if row is None:
         return None
     conds = query(
         "SELECT * FROM rule_conditions WHERE rule_id = ? ORDER BY ord, id",
         (rule_id,),
+        conn=conn,
     )
     return {
         "id": row["id"],
@@ -371,9 +392,9 @@ def fetch_rule(rule_id: int) -> dict | None:
     }
 
 
-def fetch_rules() -> list[dict]:
-    rows = query("SELECT id FROM rules ORDER BY id")
-    return [r for r in (fetch_rule(row["id"]) for row in rows) if r]
+def fetch_rules(conn: sqlite3.Connection | None = None) -> list[dict]:
+    rows = query("SELECT id FROM rules ORDER BY id", conn=conn)
+    return [r for r in (fetch_rule(row["id"], conn=conn) for row in rows) if r]
 
 
 def upsert_event(
@@ -456,8 +477,12 @@ def snapshot_import_key(
         )
 
 
-def fetch_maintenance_window(window_id: int) -> dict | None:
-    row = query_one("SELECT * FROM maintenance_windows WHERE id = ?", (window_id,))
+def fetch_maintenance_window(
+    window_id: int, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    row = query_one(
+        "SELECT * FROM maintenance_windows WHERE id = ?", (window_id,), conn=conn
+    )
     if row is None:
         return None
     return {
@@ -475,6 +500,7 @@ def fetch_maintenance_windows(
     start: float | None = None,
     end: float | None = None,
     device: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Windows overlapping the half-open filter window [start, end)."""
     where = []
@@ -492,8 +518,9 @@ def fetch_maintenance_windows(
     rows = query(
         f"SELECT id FROM maintenance_windows{clause} ORDER BY start_ts, device, id",
         params,
+        conn=conn,
     )
-    return [w for w in (fetch_maintenance_window(r["id"]) for r in rows) if w]
+    return [w for w in (fetch_maintenance_window(r["id"], conn=conn) for r in rows) if w]
 
 
 def faults_for_export() -> list[dict]:
@@ -543,7 +570,9 @@ def fetch_channel_ttl(device: str, metric: str) -> dict | None:
 
 
 def fetch_channel_ttls(
-    device: str | None = None, metric: str | None = None
+    device: str | None = None,
+    metric: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """All configured sample validity periods; channels without a row are absent
     (they keep the legacy hold-to-next-sample semantics)."""
@@ -560,6 +589,7 @@ def fetch_channel_ttls(
         f"SELECT device, metric, ttl_seconds, updated_at FROM channel_ttls{clause}"
         " ORDER BY device, metric",
         params,
+        conn=conn,
     )
     return [dict(r) for r in rows]
 

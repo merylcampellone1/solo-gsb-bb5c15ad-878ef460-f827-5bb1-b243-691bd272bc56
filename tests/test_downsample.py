@@ -348,9 +348,9 @@ def test_api_timeline_large_range_never_fetches_full_range(client, monkeypatch):
     fetched_sql = []
     real_query = db.query
 
-    def spy_query(sql, params=()):
+    def spy_query(sql, params=(), conn=None):
         fetched_sql.append(sql)
-        return real_query(sql, params)
+        return real_query(sql, params, conn=conn)
 
     monkeypatch.setattr(db, "query", spy_query)
 

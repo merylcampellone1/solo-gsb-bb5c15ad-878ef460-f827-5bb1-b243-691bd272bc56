@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -303,10 +304,14 @@ def undo_import(import_id: int, reevaluate: bool = True) -> dict:
     return result
 
 
-def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | None]:
+def _load_events_index(
+    conn: sqlite3.Connection | None = None,
+) -> tuple[dict[tuple[str, str], list[Event]], float | None]:
     events_by_channel: dict[tuple[str, str], list[Event]] = defaultdict(list)
     horizon: float | None = None
-    for row in db.query("SELECT id, device, metric, ts, value FROM events ORDER BY ts, id"):
+    for row in db.query(
+        "SELECT id, device, metric, ts, value FROM events ORDER BY ts, id", conn=conn
+    ):
         if row["value"] is None:
             continue
         ev = Event(
@@ -321,7 +326,9 @@ def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | No
     return events_by_channel, horizon
 
 
-def _load_maintenance_windows() -> list[MaintenanceWindow]:
+def _load_maintenance_windows(
+    conn: sqlite3.Connection | None = None,
+) -> list[MaintenanceWindow]:
     """All stored planned-maintenance windows as engine inputs."""
     return [
         MaintenanceWindow(
@@ -331,11 +338,13 @@ def _load_maintenance_windows() -> list[MaintenanceWindow]:
             end=w["end"],
             name=w["name"],
         )
-        for w in db.fetch_maintenance_windows()
+        for w in db.fetch_maintenance_windows(conn=conn)
     ]
 
 
-def _load_channel_ttls() -> dict[tuple[str, str], float]:
+def _load_channel_ttls(
+    conn: sqlite3.Connection | None = None,
+) -> dict[tuple[str, str], float]:
     """Configured per-channel sample validity periods as engine input.
 
     Only channels with a positive configured TTL appear here; every other
@@ -343,7 +352,7 @@ def _load_channel_ttls() -> dict[tuple[str, str], float]:
     """
     return {
         (row["device"], row["metric"]): row["ttl_seconds"]
-        for row in db.fetch_channel_ttls()
+        for row in db.fetch_channel_ttls(conn=conn)
     }
 
 
@@ -356,23 +365,32 @@ def evaluate_all_rules() -> dict:
     Per-channel sample validity periods cap each sample's held interval, so
     expired stretches satisfy no condition and likewise reset the duration.
     The suppressed pieces are stored alongside for the timeline/export.
+
+    The input reads and the fault/suppressed replacement run inside **one
+    serialized write transaction** (the same write lock every event import,
+    rule, validity-period and maintenance-window write funnels through), so
+    the inputs read here are the latest committed state at evaluation time
+    and no concurrent commit can land between the read and the replacement:
+    a stale in-flight evaluation can never overwrite a newer committed
+    recompute, and whichever evaluation commits last always reflects the
+    latest committed inputs.  Any failure rolls the whole transaction back,
+    so a failed evaluation never leaves partially replaced faults behind,
+    and readers only ever see the committed results.
     """
-    # Gather every evaluation input from one committed snapshot so the
-    # recomputed faults never combine rules/events/maintenance/TTLs read
-    # from different concurrent commits; the fault replacement below keeps
-    # its own write transaction boundary.
-    with db.read_snapshot():
-        rules = db.fetch_rules()
-        events_by_channel, horizon = _load_events_index()
+    with db.transaction() as tx:
+        # Gather every evaluation input on the writer connection, inside the
+        # replacement's own transaction: the read and the write serialize
+        # with all other writers in the same order.
+        rules = db.fetch_rules(conn=tx)
+        events_by_channel, horizon = _load_events_index(tx)
         if horizon is None:
             horizon = 0.0
-        maintenance = _load_maintenance_windows()
-        ttl_by_channel = _load_channel_ttls()
+        maintenance = _load_maintenance_windows(tx)
+        ttl_by_channel = _load_channel_ttls(tx)
 
-    total = 0
-    total_suppressed = 0
-    per_rule: list[dict] = []
-    with db.transaction() as tx:
+        total = 0
+        total_suppressed = 0
+        per_rule: list[dict] = []
         for rule in rules:
             conditions = [Condition.from_dict(c) for c in rule["conditions"]]
             result = evaluate_rule(
